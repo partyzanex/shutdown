@@ -94,3 +94,9 @@ func WaitForSignalsContext(ctx context.Context, logger Logger, sig ...os.Signal)
 	// Log a warning indicating which signal or context-related error occurred.
 	logger.Msgf("Received signal: %s", sigCtx.Err())
 }
+
+type Fn func() error
+
+func (f Fn) Close() error {
+	return f()
+}

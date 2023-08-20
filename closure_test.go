@@ -87,3 +87,12 @@ func TestWaitForSignalsContext(t *testing.T) {
 		t.Errorf("Expected log message about context deadline, got: %v", ml.messages)
 	}
 }
+
+func TestFn_Close(t *testing.T) {
+	c := Fn(func() error {
+		return nil
+	})
+	if err := c.Close(); err != nil {
+		t.Errorf("Expected no error, got: %v", err)
+	}
+}
