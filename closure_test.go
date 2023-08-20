@@ -3,74 +3,87 @@ package shutdown
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"sync"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
+	"time"
 )
 
 type pkgCloser struct {
-	closeCalled bool
-	err         error
+	mu      sync.Mutex
+	isClose bool
+	err     error
 }
 
 func (mc *pkgCloser) Close() error {
-	mc.closeCalled = true
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
+	mc.isClose = true
 	return mc.err
 }
 
-type mockClosure struct {
-	appendCalled bool
-	closeCalled  bool
-	ctxCalled    bool
-	closers      []Closer
-}
-
-func (mc *mockClosure) Append(closer Closer) {
-	mc.appendCalled = true
-	mc.closers = append(mc.closers, closer)
-}
-
-func (mc *mockClosure) Close() error {
-	mc.closeCalled = true
-	if len(mc.closers) > 0 {
-		return mc.closers[0].Close()
+func TestAppendAndClose(t *testing.T) {
+	SetPackageClosure(&Lifo{})
+	once = sync.Once{}
+	mCloser := &pkgCloser{}
+	Append(mCloser)
+	if err := Close(); err != nil || !mCloser.isClose {
+		t.Fatalf("Expected closer to be closed without errors, got: %v", err)
 	}
-	return nil
 }
 
-func (mc *mockClosure) CloseContext(ctx context.Context) error {
-	mc.ctxCalled = true
-	if len(mc.closers) > 0 {
-		return mc.closers[0].Close()
+func TestAppendAndCloseWithError(t *testing.T) {
+	SetPackageClosure(&Fifo{})
+	once = sync.Once{}
+	expectedErr := errors.New("close error")
+	mCloser := &pkgCloser{err: expectedErr}
+	Append(mCloser)
+	if err := Close(); err == nil || err.Error() != expectedErr.Error() {
+		t.Fatalf("Expected error: %v, got: %v", expectedErr, err)
 	}
-	return nil
 }
 
-func TestPackageFunctions(t *testing.T) {
-	// Reset package state after the test
-	defer func() {
-		SetPackageClosure(&Lifo{})
+type mockLogger struct {
+	messages []string
+	mu       sync.Mutex
+}
+
+func (ml *mockLogger) Warnf(format string, args ...interface{}) {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+
+	ml.messages = append(ml.messages, fmt.Sprintf(format, args...))
+}
+
+func TestWaitForSignals(t *testing.T) {
+	ml := &mockLogger{}
+	signals := []os.Signal{os.Interrupt}
+
+	go func() {
+		// Simulate a signal after a short delay
+		time.Sleep(100 * time.Millisecond)
+		process, _ := os.FindProcess(os.Getpid())
+		_ = process.Signal(os.Interrupt)
 	}()
 
-	// Mock closure for testing
-	mc := &mockClosure{}
-	SetPackageClosure(mc)
+	WaitForSignals(ml, signals...)
 
-	// Test Append
-	closer := &pkgCloser{}
-	Append(closer)
-	assert.True(t, mc.appendCalled, "Append was not called on the mock closure")
-	assert.Contains(t, mc.closers, closer, "Closer was not added to the mock closure")
+	if len(ml.messages) == 0 || ml.messages[0] != "Received signal: interrupt" {
+		t.Errorf("Expected log message about received signal, got: %v", ml.messages)
+	}
+}
 
-	// Test Close and CloseContext
-	errClose := errors.New("test close error")
-	closer.err = errClose
+func TestWaitForSignalsContext(t *testing.T) {
+	ml := &mockLogger{}
+	signals := []os.Signal{os.Interrupt}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
 
-	err := Close()
-	assert.True(t, mc.closeCalled, "Close was not called on the mock closure")
-	assert.Equal(t, errClose, err, "Unexpected error returned from Close")
+	WaitForSignalsContext(ctx, ml, signals...)
 
-	err = CloseContext(context.Background())
-	assert.True(t, mc.ctxCalled, "CloseContext was not called on the mock closure")
-	assert.Equal(t, errClose, err, "Unexpected error returned from CloseContext")
+	if len(ml.messages) == 0 || ml.messages[0] != "Received signal: context deadline exceeded" {
+		t.Errorf("Expected log message about context deadline, got: %v", ml.messages)
+	}
 }

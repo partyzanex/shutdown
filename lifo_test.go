@@ -32,7 +32,7 @@ func TestLifoCloseContext(t *testing.T) {
 
 	lifo.Append(timeoutCloser)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	err = lifo.CloseContext(ctx)
 	assert.NotNil(t, err)
