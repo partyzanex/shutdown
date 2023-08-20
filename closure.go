@@ -60,7 +60,7 @@ func CloseContext(ctx context.Context) error {
 
 // Logger is an interface representing logging capabilities. It provides a method to log warning messages.
 type Logger interface {
-	Warnf(format string, args ...interface{})
+	Msgf(format string, args ...interface{})
 }
 
 // WaitForSignals blocks until a given signal (or signals) is received.
@@ -76,7 +76,7 @@ func WaitForSignals(logger Logger, sig ...os.Signal) {
 	defer signal.Stop(c)
 
 	// Log a warning when a signal is received.
-	logger.Warnf("Received signal: %s", <-c)
+	logger.Msgf("Received signal: %s", <-c)
 }
 
 // WaitForSignalsContext is similar to WaitForSignals but with support for context.
@@ -92,5 +92,5 @@ func WaitForSignalsContext(ctx context.Context, logger Logger, sig ...os.Signal)
 	<-sigCtx.Done()
 
 	// Log a warning indicating which signal or context-related error occurred.
-	logger.Warnf("Received signal: %s", sigCtx.Err())
+	logger.Msgf("Received signal: %s", sigCtx.Err())
 }

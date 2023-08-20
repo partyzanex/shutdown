@@ -50,7 +50,7 @@ type mockLogger struct {
 	mu       sync.Mutex
 }
 
-func (ml *mockLogger) Warnf(format string, args ...interface{}) {
+func (ml *mockLogger) Msgf(format string, args ...interface{}) {
 	ml.mu.Lock()
 	defer ml.mu.Unlock()
 
