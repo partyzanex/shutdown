@@ -1,0 +1,9 @@
+.idea/
+bin/
+vendor/
+*.mk
+*.out
+*.test
+*.log
+coverage.txt
+coverage.xml
