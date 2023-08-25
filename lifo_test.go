@@ -52,3 +52,22 @@ func TestLifoClose(t *testing.T) {
 	assert.NotNil(t, err)
 	assert.Contains(t, err.Error(), "second error")
 }
+
+func TestLifo_WithContext(t *testing.T) {
+	l := &Lifo{}
+
+	// Embed the Lifo instance into a new context.
+	newCtx := l.WithContext(context.Background())
+
+	// Retrieve the Lifo instance (as a Closure) from the new context.
+	extractedClosure, ok := ClosureFromContext(newCtx)
+
+	if !ok {
+		t.Fatalf("Expected to find a closure in the context, but found none.")
+	}
+
+	// Type assert the extracted closure to *Lifo to verify it's the correct type.
+	if _, isLifo := extractedClosure.(*Lifo); !isLifo {
+		t.Fatalf("Expected the closure in context to be of type *Lifo, but it's not.")
+	}
+}

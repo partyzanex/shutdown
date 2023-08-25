@@ -15,28 +15,29 @@ type Closer = io.Closer
 type Closure interface {
 	Closer
 
-	Append(closer Closer)                   // Appends a new closer
-	CloseContext(ctx context.Context) error // Closes resources with context support
+	Append(closer Closer)                            // Appends a new closer
+	CloseContext(ctx context.Context) error          // Closes resources with context support
+	WithContext(ctx context.Context) context.Context // Sets the context for the closure
 }
 
 var (
-	closure Closure    = &Lifo{} // Default implementation of Closure using Lifo (Last In First Out) strategy
-	mu      sync.Mutex           // Mutex to ensure thread safety
-	once    sync.Once
+	pkgClosure Closure    = &Lifo{} // Default implementation of Closure using Lifo (Last In First Out) strategy
+	mu         sync.Mutex           // Mutex to ensure thread safety
+	once       sync.Once
 )
 
 // SetPackageClosure allows for setting a different Closure implementation.
 func SetPackageClosure(c Closure) {
 	mu.Lock()         // Acquiring the lock
 	defer mu.Unlock() // Making sure to release the lock after the function exits
-	closure = c       // Set the global closure to the provided implementation
+	pkgClosure = c    // Set the global closure to the provided implementation
 }
 
 // Append appends a new closer to the global closure.
 func Append(closer Closer) {
-	mu.Lock()              // Acquiring the lock
-	defer mu.Unlock()      // Making sure to release the lock after the function exits
-	closure.Append(closer) // Appending the closer
+	mu.Lock()                 // Acquiring the lock
+	defer mu.Unlock()         // Making sure to release the lock after the function exits
+	pkgClosure.Append(closer) // Appending the closer
 }
 
 // Close attempts to close all appended resources.
@@ -52,7 +53,7 @@ func CloseContext(ctx context.Context) error {
 	var err error
 
 	once.Do(func() {
-		err = closure.CloseContext(ctx) // Close all resources and return any encountered error
+		err = pkgClosure.CloseContext(ctx) // Close all resources and return any encountered error
 	})
 
 	return err
@@ -99,4 +100,39 @@ type Fn func() error
 
 func (f Fn) Close() error {
 	return f()
+}
+
+// CloseOnSignal waits for the specified signals and then closes the global closure.
+// It utilizes the WaitForSignals function to wait for the signals.
+// Once a signal is received, it will close the global closure using the Close function.
+// The Logger parameter is used to log the received signal.
+//
+// Parameters:
+// - logger: An instance that implements the Logger interface, used for logging.
+// - sig: A variable list of os.Signal values that the function should wait for.
+//
+// Returns:
+// - An error if encountered while closing the global closure; otherwise, nil.
+func CloseOnSignal(logger Logger, sig ...os.Signal) error {
+	WaitForSignals(logger, sig...)
+
+	return Close()
+}
+
+// CloseOnSignalContext is similar to CloseOnSignal but with support for context.
+// It waits for the specified signals or until the context is done, then closes the global closure.
+// It utilizes the WaitForSignalsContext function to wait for the signals with context support.
+// Once a signal is received or the context is done, it will close the global closure using the CloseContext function.
+//
+// Parameters:
+// - ctx: The context that can be used to cancel or time out the waiting process.
+// - logger: An instance that implements the Logger interface, used for logging.
+// - sig: A variable list of os.Signal values that the function should wait for.
+//
+// Returns:
+// - An error if encountered while closing the global closure; otherwise, nil.
+func CloseOnSignalContext(ctx context.Context, logger Logger, sig ...os.Signal) error {
+	WaitForSignalsContext(ctx, logger, sig...)
+
+	return CloseContext(ctx)
 }

@@ -62,3 +62,19 @@ func TestGroupCloseContext(t *testing.T) {
 	assert.Equal(t, int32(1), atomic.LoadInt32(&c2.calls))
 	assert.Equal(t, int32(0), atomic.LoadInt32(&c3.calls)) // c3 should not be closed due to context timeout
 }
+
+func TestGroup_WithContext(t *testing.T) {
+	// Create a new instance of Group
+	g := &Group{}
+
+	// Associate the Group instance with a new context
+	ctx := g.WithContext(context.Background())
+
+	// Retrieve the Group (as a Closure) from the context
+	closure, ok := ClosureFromContext(ctx)
+
+	// Assert that the retrieved closure is indeed our Group instance
+	if !ok || closure != g {
+		t.Fatalf("Expected to retrieve the original group from context, but got %v", closure)
+	}
+}

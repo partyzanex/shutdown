@@ -70,3 +70,15 @@ func (g *Group) CloseContext(ctx context.Context) error {
 func (g *Group) Close() error {
 	return g.CloseContext(context.Background()) // Use a default background context.
 }
+
+// WithContext associates the Group instance with the provided context.
+// It uses the ClosureToContext function to embed the group into the context.
+//
+// Parameters:
+// - ctx: The context to which the Group instance will be associated.
+//
+// Returns:
+// - A new context containing the Group instance.
+func (g *Group) WithContext(ctx context.Context) context.Context {
+	return ClosureToContext(ctx, g)
+}

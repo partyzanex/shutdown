@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 type pkgCloser struct {
@@ -95,4 +97,48 @@ func TestFn_Close(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Errorf("Expected no error, got: %v", err)
 	}
+}
+
+func getLastLoggedMessage(ml *mockLogger) string {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+
+	if len(ml.messages) == 0 {
+		return ""
+	}
+
+	return ml.messages[len(ml.messages)-1]
+}
+
+func TestCloseOnSignal(t *testing.T) {
+	logger := &mockLogger{}
+
+	go func() {
+		// Simulate a signal after a short delay
+		time.Sleep(100 * time.Millisecond)
+		process, _ := os.FindProcess(os.Getpid())
+		_ = process.Signal(os.Interrupt)
+	}()
+
+	// Normally, you'd want to simulate the actual os.Signal here, but this example
+	// just checks if the logger logs the message.
+	err := CloseOnSignal(logger, os.Interrupt)
+	assert.NoError(t, err)
+
+	assert.Equal(t, "Received signal: interrupt", getLastLoggedMessage(logger))
+}
+
+func TestCloseOnSignalContextCancelled(t *testing.T) {
+	logger := &mockLogger{}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Simulate context completion without waiting for the actual os.Signal.
+	go func() {
+		cancel()
+	}()
+
+	err := CloseOnSignalContext(ctx, logger, os.Interrupt)
+	assert.NoError(t, err)
+
+	assert.Equal(t, "Received signal: context canceled", getLastLoggedMessage(logger))
 }

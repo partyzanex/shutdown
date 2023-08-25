@@ -51,3 +51,10 @@ func (l *Lifo) CloseContext(ctx context.Context) error {
 func (l *Lifo) Close() error {
 	return l.CloseContext(context.Background()) // Using a background context which will never be cancelled.
 }
+
+// WithContext embeds the Lifo instance into the given context.
+// It utilizes the ClosureToContext function to associate the Lifo
+// instance (as a Closure) with the provided context.
+func (l *Lifo) WithContext(ctx context.Context) context.Context {
+	return ClosureToContext(ctx, l)
+}

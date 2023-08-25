@@ -51,6 +51,12 @@ func (f *Fifo) Close() error {
 	return f.CloseContext(context.Background()) // Using a background context which will never be cancelled
 }
 
+// WithContext associates the Fifo instance with the given context.
+// It utilizes the ClosureToContext function to store the Fifo instance as a Closure within the context.
+func (f *Fifo) WithContext(ctx context.Context) context.Context {
+	return ClosureToContext(ctx, f)
+}
+
 // callClose safely calls the Close method of the given closer and appends any errors.
 func callClose(closer Closer, errs *error) {
 	if err := closer.Close(); err != nil {

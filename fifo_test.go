@@ -71,3 +71,19 @@ func TestFifo(t *testing.T) {
 		assert.Contains(t, err.Error(), context.DeadlineExceeded.Error())
 	})
 }
+
+func TestFifo_WithContext(t *testing.T) {
+	// Create a new Fifo instance
+	fifo := &Fifo{}
+
+	// Use the WithContext method to embed the Fifo instance into a new context.
+	ctxWithFifo := fifo.WithContext(context.Background())
+
+	// Extract the Closure (which should be our Fifo) from the context.
+	extractedClosure, ok := ClosureFromContext(ctxWithFifo)
+
+	// Assert that the Closure extracted from the context is indeed our Fifo instance.
+	if !ok || extractedClosure != fifo {
+		t.Fatalf("Expected to retrieve the original Fifo instance from context, but got %v", extractedClosure)
+	}
+}
