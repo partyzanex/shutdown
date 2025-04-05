@@ -11,6 +11,11 @@ import (
 // Closer is an alias for io.Closer. It represents an interface that requires a Close method.
 type Closer = io.Closer
 
+// QuietCloser is an interface that requires a Close method.
+type QuietCloser interface {
+	Close() // Close method without returning an error.
+}
+
 // Closure interface defines methods for appending and closing resources.
 type Closure interface {
 	Closer
@@ -38,6 +43,13 @@ func Append(closer Closer) {
 	mu.Lock()                 // Acquiring the lock
 	defer mu.Unlock()         // Making sure to release the lock after the function exits
 	pkgClosure.Append(closer) // Appending the closer
+}
+
+// AppendQuiet appends a new quiet closer (QuietCloser) to the global closure.
+func AppendQuiet(closer QuietCloser) {
+	mu.Lock()                                // Acquiring the lock
+	defer mu.Unlock()                        // Making sure to release the lock after the function exits
+	pkgClosure.Append(QuietFn(closer.Close)) // Appending the closer
 }
 
 // Close attempts to close all appended resources.
@@ -96,10 +108,21 @@ func WaitForSignalsContext(ctx context.Context, logger Logger, sig ...os.Signal)
 	logger.Msgf("Received signal: %s", sigCtx.Err())
 }
 
+// Fn is a function that returns an error.
 type Fn func() error
 
+// Close implements the Closer interface.
 func (f Fn) Close() error {
 	return f()
+}
+
+// QuietFn is a function that does not return an error.
+type QuietFn func()
+
+// Close implements the Closer interface for a function that does not return an error.
+func (f QuietFn) Close() error {
+	f()
+	return nil
 }
 
 // CloseOnSignal waits for the specified signals and then closes the global closure.

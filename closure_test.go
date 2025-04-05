@@ -36,6 +36,37 @@ func TestAppendAndClose(t *testing.T) {
 	}
 }
 
+func TestAppendFnAndClose(t *testing.T) {
+	SetPackageClosure(&Lifo{})
+	once = sync.Once{}
+	mCloser := &pkgCloser{}
+	Append(Fn(mCloser.Close))
+	if err := Close(); err != nil || !mCloser.isClose {
+		t.Fatalf("Expected closer to be closed without errors, got: %v", err)
+	}
+}
+
+type quietCloser struct {
+	mu      sync.Mutex
+	isClose bool
+}
+
+func (mc *quietCloser) Close() {
+	mc.mu.Lock()
+	mc.isClose = true
+	mc.mu.Unlock()
+}
+
+func TestAppendQuietAndClose(t *testing.T) {
+	SetPackageClosure(&Lifo{})
+	once = sync.Once{}
+	mCloser := &quietCloser{}
+	AppendQuiet(mCloser)
+	if err := Close(); err != nil || !mCloser.isClose {
+		t.Fatalf("Expected closer to be closed without errors, got: %v", err)
+	}
+}
+
 func TestAppendAndCloseWithError(t *testing.T) {
 	SetPackageClosure(&Fifo{})
 	once = sync.Once{}
