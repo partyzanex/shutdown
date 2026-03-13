@@ -2,160 +2,155 @@ package shutdown
 
 import (
 	"context"
+	"errors"
 	"io"
-	"os"
-	"os/signal"
-	"sync"
 )
 
-// Closer is an alias for io.Closer. It represents an interface that requires a Close method.
+// Closer is the minimal contract accepted by shutdown managers.
+//
+// It is declared as an alias of io.Closer so existing resources that already
+// implement Close() error can be registered without adaptation.
+//
+// A manager treats each registered Closer as a single shutdown step. Depending
+// on the concrete manager implementation, those steps may be executed
+// sequentially or concurrently when shutdown starts.
 type Closer = io.Closer
 
-// QuietCloser is an interface that requires a Close method.
+// ContextCloser is implemented by resources that support context-aware shutdown.
+//
+// When a registered resource implements ContextCloser, managers prefer
+// CloseContext over Close during CloseContext execution. This allows the
+// resource to observe cancellation, deadlines, and other context-derived
+// shutdown policies.
+//
+// If a resource does not implement ContextCloser, managers fall back to the
+// regular Close method defined by Closer.
+type ContextCloser interface {
+	CloseContext(ctx context.Context) error
+}
+
+// QuietCloser is a convenience contract for resources whose shutdown operation
+// cannot fail.
+//
+// The compat layer can wrap a QuietCloser into a regular Closer by adapting its
+// Close method to return a nil error.
 type QuietCloser interface {
-	Close() // Close method without returning an error.
+	Close()
 }
 
-// Closure interface defines methods for appending and closing resources.
-type Closure interface {
-	Closer
-
-	Append(closer Closer)                            // Appends a new closer
-	CloseContext(ctx context.Context) error          // Closes resources with context support
-	WithContext(ctx context.Context) context.Context // Sets the context for the closure
+// Manager is the common contract implemented by all shutdown strategies.
+//
+// A Manager owns a collection of registered closers and is responsible for
+// invoking them exactly once when shutdown begins. Implementations differ in the
+// order and concurrency model used during shutdown, but they share the same
+// high-level lifecycle:
+//
+//  1. callers register resources with Append;
+//  2. callers trigger shutdown with Close or CloseContext;
+//  3. subsequent Close calls are idempotent and return the result of the first
+//     shutdown attempt.
+//
+// Append is intentionally simple and does not return an error. In the current
+// implementation, attempting to append after shutdown has begun is considered a
+// programming error and panics.
+//
+// CloseContext requires a non-nil context. Passing nil is considered a caller
+// bug and may panic inside a concrete manager implementation.
+type Manager interface {
+	Append(closer Closer)
+	Close() error
+	CloseContext(ctx context.Context) error
 }
 
-var (
-	pkgClosure Closure    = &Lifo{} // Default implementation of Closure using Lifo (Last In First Out) strategy
-	mu         sync.Mutex           // Mutex to ensure thread safety
-	once       sync.Once
-)
-
-// SetPackageClosure allows for setting a different Closure implementation.
-func SetPackageClosure(c Closure) {
-	mu.Lock()         // Acquiring the lock
-	defer mu.Unlock() // Making sure to release the lock after the function exits
-	pkgClosure = c    // Set the global closure to the provided implementation
-}
-
-// Append appends a new closer to the global closure.
-func Append(closer Closer) {
-	mu.Lock()                 // Acquiring the lock
-	defer mu.Unlock()         // Making sure to release the lock after the function exits
-	pkgClosure.Append(closer) // Appending the closer
-}
-
-// AppendQuiet appends a new quiet closer (QuietCloser) to the global closure.
-func AppendQuiet(closer QuietCloser) {
-	mu.Lock()                                // Acquiring the lock
-	defer mu.Unlock()                        // Making sure to release the lock after the function exits
-	pkgClosure.Append(QuietFn(closer.Close)) // Appending the closer
-}
-
-// Close attempts to close all appended resources.
-func Close() error {
-	return CloseContext(context.Background()) // Close all resources and return any encountered error
-}
-
-// CloseContext attempts to close all appended resources with context support.
-func CloseContext(ctx context.Context) error {
-	mu.Lock()         // Acquiring the lock
-	defer mu.Unlock() // Making sure to release the lock after the function exits
-
-	var err error
-
-	once.Do(func() {
-		err = pkgClosure.CloseContext(ctx) // Close all resources and return any encountered error
-	})
-
-	return err
-}
-
-// Logger is an interface representing logging capabilities. It provides a method to log warning messages.
-type Logger interface {
-	Msgf(format string, args ...interface{})
-}
-
-// WaitForSignals blocks until a given signal (or signals) is received.
-// Once the signal is caught, it logs a warning message using the provided logger.
-func WaitForSignals(logger Logger, sig ...os.Signal) {
-	// Create a channel to listen for signals.
-	c := make(chan os.Signal, 1)
-
-	// Register the given signals to the channel.
-	signal.Notify(c, sig...)
-
-	// Ensure that we stop the signal notifications to the channel when the function returns.
-	defer signal.Stop(c)
-
-	// Log a warning when a signal is received.
-	logger.Msgf("Received signal: %s", <-c)
-}
-
-// WaitForSignalsContext is similar to WaitForSignals but with support for context.
-// It blocks until a given signal (or signals) is received or the context is done.
-func WaitForSignalsContext(ctx context.Context, logger Logger, sig ...os.Signal) {
-	// Create a context that will be done when the given signals are caught or the parent context is done.
-	sigCtx, cancel := signal.NotifyContext(ctx, sig...)
-
-	// Ensure resources are released when the function returns.
-	defer cancel()
-
-	// Wait until the signal context is done (either from a caught signal or the parent context).
-	<-sigCtx.Done()
-
-	// Log a warning indicating which signal or context-related error occurred.
-	logger.Msgf("Received signal: %s", sigCtx.Err())
-}
-
-// Fn is a function that returns an error.
+// Fn adapts a plain function to the Closer interface.
+//
+// Fn is useful when shutdown logic does not naturally live on a struct that
+// implements io.Closer. It allows callers to register inline or delegated
+// cleanup logic without creating a dedicated type.
+//
+// Example:
+//
+//	manager.Append(shutdown.Fn(func() error {
+//		return server.Close()
+//	}))
 type Fn func() error
 
-// Close implements the Closer interface.
+// Close calls the wrapped function and returns its result.
 func (f Fn) Close() error {
 	return f()
 }
 
-// QuietFn is a function that does not return an error.
+// ContextFn adapts a context-aware function to both Closer and ContextCloser.
+//
+// When a manager performs context-aware shutdown, it calls CloseContext and the
+// wrapped function receives the caller-provided context. When a caller uses the
+// plain Close method, ContextFn falls back to a background context.
+//
+// This adapter is useful for resources whose shutdown path needs deadline or
+// cancellation information but does not warrant a custom type.
+type ContextFn func(ctx context.Context) error
+
+// Close invokes the wrapped function with context.Background().
+//
+// This preserves compatibility with the Closer interface when no explicit
+// context is available.
+func (f ContextFn) Close() error {
+	return f.CloseContext(context.Background())
+}
+
+// CloseContext invokes the wrapped function with the provided context.
+func (f ContextFn) CloseContext(ctx context.Context) error {
+	return f(ctx)
+}
+
+// QuietFn adapts a no-error function to the Closer interface.
+//
+// It is the functional counterpart to QuietCloser and is useful for
+// fire-and-forget cleanup logic that cannot fail.
 type QuietFn func()
 
-// Close implements the Closer interface for a function that does not return an error.
+// Close invokes the wrapped function and always returns nil.
 func (f QuietFn) Close() error {
 	f()
 	return nil
 }
 
-// CloseOnSignal waits for the specified signals and then closes the global closure.
-// It utilizes the WaitForSignals function to wait for the signals.
-// Once a signal is received, it will close the global closure using the Close function.
-// The Logger parameter is used to log the received signal.
+// closeWithContext executes a single shutdown step.
 //
-// Parameters:
-// - logger: An instance that implements the Logger interface, used for logging.
-// - sig: A variable list of os.Signal values that the function should wait for.
+// The function prefers ContextCloser when available so that resources capable of
+// observing deadlines and cancellation receive the caller-provided context.
+// Otherwise it falls back to the standard Close method.
 //
-// Returns:
-// - An error if encountered while closing the global closure; otherwise, nil.
-func CloseOnSignal(logger Logger, sig ...os.Signal) error {
-	WaitForSignals(logger, sig...)
+// A nil closer is treated as a no-op to keep manager implementations simple when
+// they need to handle optional registrations.
+func closeWithContext(ctx context.Context, closer Closer) error {
+	if closer == nil {
+		return nil
+	}
 
-	return Close()
+	if contextCloser, ok := closer.(ContextCloser); ok {
+		return contextCloser.CloseContext(ctx)
+	}
+
+	return closer.Close()
 }
 
-// CloseOnSignalContext is similar to CloseOnSignal but with support for context.
-// It waits for the specified signals or until the context is done, then closes the global closure.
-// It utilizes the WaitForSignalsContext function to wait for the signals with context support.
-// Once a signal is received or the context is done, it will close the global closure using the CloseContext function.
+// appendContextError appends ctxErr to errs unless it is nil or already present.
 //
-// Parameters:
-// - ctx: The context that can be used to cancel or time out the waiting process.
-// - logger: An instance that implements the Logger interface, used for logging.
-// - sig: A variable list of os.Signal values that the function should wait for.
-//
-// Returns:
-// - An error if encountered while closing the global closure; otherwise, nil.
-func CloseOnSignalContext(ctx context.Context, logger Logger, sig ...os.Signal) error {
-	WaitForSignalsContext(ctx, logger, sig...)
+// Managers use this helper when a shutdown loop stops because the supplied
+// context has been canceled or its deadline has expired. The helper preserves
+// the original slice if the context error is already represented in the
+// accumulated error set, including inside an error produced by errors.Join.
+func appendContextError(errs []error, ctxErr error) []error {
+	if ctxErr == nil {
+		return errs
+	}
 
-	return CloseContext(ctx)
+	for _, err := range errs {
+		if errors.Is(err, ctxErr) {
+			return errs
+		}
+	}
+
+	return append(errs, ctxErr)
 }

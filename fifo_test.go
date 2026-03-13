@@ -3,87 +3,86 @@ package shutdown
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-type mockCloser struct {
-	closeFunc func() error
+func TestFIFOClosesInAppendOrder(t *testing.T) {
+	fifo := NewFIFO()
+	var order []string
+	expected := errors.New("second failed")
+
+	fifo.Append(Fn(func() error {
+		order = append(order, "first")
+		return nil
+	}))
+	fifo.Append(Fn(func() error {
+		order = append(order, "second")
+		return expected
+	}))
+
+	err := fifo.Close()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, expected)
+
+	assert.True(t, reflect.DeepEqual(order, []string{"first", "second"}), "unexpected close order: %v", order)
 }
 
-func (m *mockCloser) Close() error {
-	if m.closeFunc != nil {
-		return m.closeFunc()
-	}
-	return nil
+func TestFIFOStopsSchedulingAfterContextCancellation(t *testing.T) {
+	fifo := NewFIFO()
+	called := false
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	fifo.Append(Fn(func() error {
+		called = true
+		return nil
+	}))
+
+	err := fifo.CloseContext(ctx)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.False(t, called)
 }
 
-func TestFifo(t *testing.T) {
-	t.Run("add and close without error", func(t *testing.T) {
-		f := &Fifo{}
-		closer1 := &mockCloser{}
-		closer2 := &mockCloser{}
+func TestFIFOIsIdempotent(t *testing.T) {
+	fifo := NewFIFO()
+	calls := 0
+	expected := errors.New("boom")
 
-		f.Append(closer1)
-		f.Append(closer2)
+	fifo.Append(Fn(func() error {
+		calls++
+		return expected
+	}))
 
-		err := f.Close()
-		assert.Nil(t, err)
-	})
+	first := fifo.Close()
+	second := fifo.Close()
 
-	t.Run("add and close with error", func(t *testing.T) {
-		f := &Fifo{}
-		closer1 := &mockCloser{
-			closeFunc: func() error {
-				return errors.New("close error")
-			},
-		}
-		closer2 := &mockCloser{}
-
-		f.Append(closer1)
-		f.Append(closer2)
-
-		err := f.Close()
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "close error")
-	})
-
-	t.Run("close with context cancel", func(t *testing.T) {
-		f := &Fifo{}
-		closer1 := &mockCloser{
-			closeFunc: func() error {
-				time.Sleep(100 * time.Millisecond)
-				return nil
-			},
-		}
-		closer2 := &mockCloser{}
-
-		f.Append(closer1)
-		f.Append(closer2)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		defer cancel()
-
-		err := f.CloseContext(ctx)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), context.DeadlineExceeded.Error())
-	})
+	require.Error(t, first)
+	require.Error(t, second)
+	assert.ErrorIs(t, first, expected)
+	assert.ErrorIs(t, second, expected)
+	assert.Equal(t, 1, calls)
 }
 
-func TestFifo_WithContext(t *testing.T) {
-	// Create a new Fifo instance
-	fifo := &Fifo{}
+func TestFIFOAppendIgnoresNilCloser(t *testing.T) {
+	fifo := NewFIFO()
 
-	// Use the WithContext method to embed the Fifo instance into a new context.
-	ctxWithFifo := fifo.WithContext(context.Background())
+	assert.NotPanics(t, func() {
+		fifo.Append(nil)
+	})
 
-	// Extract the Closure (which should be our Fifo) from the context.
-	extractedClosure, ok := ClosureFromContext(ctxWithFifo)
+	assert.Empty(t, fifo.queue)
+}
 
-	// Assert that the Closure extracted from the context is indeed our Fifo instance.
-	if !ok || extractedClosure != fifo {
-		t.Fatalf("Expected to retrieve the original Fifo instance from context, but got %v", extractedClosure)
-	}
+func TestFIFOAppendPanicsAfterClose(t *testing.T) {
+	fifo := NewFIFO()
+
+	require.NoError(t, fifo.Close())
+	require.PanicsWithValue(t, "shutdown: append after close", func() {
+		fifo.Append(Fn(func() error { return nil }))
+	})
 }

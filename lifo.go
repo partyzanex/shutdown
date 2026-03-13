@@ -2,59 +2,89 @@ package shutdown
 
 import (
 	"context"
+	"errors"
 	"sync"
-
-	"go.uber.org/multierr"
 )
 
-// Lifo represents a stack (Last-In, First-Out) of resources that need to be closed.
+// Lifo closes registered resources in last-in, first-out order.
+//
+// The most recently appended resource is closed first. This is the classic
+// stack-like shutdown strategy and is often a good fit when resources should be
+// unwound in reverse acquisition order.
+//
+// Lifo is safe for concurrent use and performs shutdown at most once.
 type Lifo struct {
-	stack []Closer   // The stack of resources to close.
-	mx    sync.Mutex // Mutex for thread safety.
+	mu     sync.Mutex
+	once   sync.Once
+	closed bool
+	result error
+	stack  []Closer
 }
 
-// Append pushes a new closer onto the Lifo stack.
+// NewLIFO constructs an empty LIFO shutdown manager.
+func NewLIFO() *Lifo {
+	return &Lifo{}
+}
+
+// Append registers a closer to be executed during shutdown.
+//
+// Nil closers are ignored. Appending after shutdown has started panics.
 func (l *Lifo) Append(closer Closer) {
-	l.mx.Lock()         // Acquire the lock to ensure thread safety.
-	defer l.mx.Unlock() // Release the lock after the function finishes.
+	if closer == nil {
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.closed {
+		panic("shutdown: append after close")
+	}
+
 	l.stack = append(l.stack, closer)
 }
 
-// CloseContext attempts to close each resource in the Lifo stack with context support.
-// It starts closing from the top of the stack (Last-In resource).
+// CloseContext starts LIFO shutdown using the supplied context.
+//
+// Registered closers are executed in reverse append order. The manager checks
+// ctx.Err() before scheduling the next closer; if the context has been
+// canceled, remaining closers are skipped and the context error is joined into
+// the final result.
+//
+// Context-aware closers receive the supplied context through CloseContext.
+// Plain closers are executed through Close.
+//
+// Shutdown is idempotent: only the first call executes closers.
+//
+// ctx must be non-nil. Passing nil is considered a caller bug and may panic.
 func (l *Lifo) CloseContext(ctx context.Context) error {
-	l.mx.Lock()         // Acquire the lock to ensure thread safety.
-	defer l.mx.Unlock() // Release the lock after the function finishes.
+	l.once.Do(func() {
+		l.mu.Lock()
+		l.closed = true
+		closers := append([]Closer(nil), l.stack...)
+		l.stack = nil
+		l.mu.Unlock()
 
-	var errs error // This will store the accumulated errors.
+		errs := make([]error, 0, len(closers)+1)
 
-	// Start from the top of the stack and iterate in reverse order.
-	for i := len(l.stack) - 1; i >= 0; i-- {
-		next := make(chan struct{}) // Channel to signal completion of the closer.
+		for i := len(closers) - 1; i >= 0; i-- {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				errs = appendContextError(errs, ctxErr)
+				break
+			}
 
-		go func() {
-			callClose(l.stack[i], &errs) // Call the close function for the current closer.
-			close(next)
-		}()
-
-		select {
-		case <-ctx.Done(): // If the context is cancelled or times out.
-			return multierr.Append(errs, ctx.Err()) // Return the accumulated errors and the context error.
-		case <-next: // Move to the next closer in the stack after the current one finishes.
+			if err := closeWithContext(ctx, closers[i]); err != nil {
+				errs = append(errs, err)
+			}
 		}
-	}
 
-	return errs // Return the accumulated errors.
+		l.result = errors.Join(errs...)
+	})
+
+	return l.result
 }
 
-// Close attempts to close all resources in the Lifo stack without context support.
+// Close starts LIFO shutdown with context.Background().
 func (l *Lifo) Close() error {
-	return l.CloseContext(context.Background()) // Using a background context which will never be cancelled.
-}
-
-// WithContext embeds the Lifo instance into the given context.
-// It utilizes the ClosureToContext function to associate the Lifo
-// instance (as a Closure) with the provided context.
-func (l *Lifo) WithContext(ctx context.Context) context.Context {
-	return ClosureToContext(ctx, l)
+	return l.CloseContext(context.Background())
 }

@@ -1,93 +1,93 @@
 # Shutdown
 
-The Shutdown provides a structured approach to managing and safely closing resources in a Go application.
-It offers a variety of strategies to handle different ordering preferences for closing resources such as
-**FIFO** (First-In, First-Out), **LIFO** (Last-In, First-Out), and **group**-based closings.
+`shutdown` is a small Go library for explicit, instance-based shutdown management.
 
-## Features
+The core package provides three strategies:
 
-* **Concurrency Safe:** All operations are made concurrency safe using mutex locks.
-* **Context Support:** Allows you to close resources with context support. This is useful for timeouts or external cancellation.
-* **Error Aggregation:** Combines errors from multiple closers into a single error using the [go.uber.org/multierr](go.uber.org/multierr) library.
+- `Lifo` for last-in, first-out shutdown
+- `Fifo` for first-in, first-out shutdown
+- `Group` for concurrent shutdown
 
-## Components
+## Requirements
 
-### Closer
+- Go `1.25+`
 
-An alias for `io.Closer` interface which requires a Close method.
+## Design
 
-### FIFO (First-In, First-Out)
-
-Fifo struct manages a queue of resources to be closed in the order they were added.
-
-### LIFO (Last-In, First-Out)
-
-Lifo struct manages a stack of resources, ensuring they are closed in the reverse order they were added.
-
-### Group
-
-Group struct manages a collection of resources that need to be closed. It spawns a goroutine 
-for each closer to ensure they close concurrently.
-
-## Installation
-
-Make sure you have Go installed and use:
-
-```shell
-go get github.com/partyzanex/shutdown@latest
-```
-
-## Usage
-
-### Appending Closers:
-
-Here's an example showcasing the **Lifo** strategy, where resources are added to a 
-stack and then closed in a Last-In, First-Out manner:
+The root package is instance-first: create a shutdown manager, append closers, then close it explicitly.
 
 ```go
-type MyCloser struct{}
+manager := shutdown.NewLIFO()
+manager.Append(db)
+manager.Append(server)
 
-func (c *MyCloser) Close() error {
-    return errors.New("my closer error")
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+if err := manager.CloseContext(ctx); err != nil {
+	log.Printf("shutdown failed: %v", err)
 }
 ```
 
-now we can add our closers to the stack:
+Package-level convenience APIs live in `shutdown/compat`. They exist for compatibility and simple wiring, but new code should prefer instance-based managers from the root package.
+
+## Context semantics
+
+`CloseContext` behaves as follows:
+
+- if a closer implements `CloseContext(context.Context) error`, that method is used;
+- otherwise the library falls back to `Close() error`;
+- `Lifo` and `Fifo` stop scheduling new closers after context cancellation;
+- `Group` closes resources concurrently and waits for all started closers to finish;
+- errors are aggregated with `errors.Join`.
+
+`CloseContext` requires a non-nil context. Passing `nil` is treated as a caller bug and may panic.
+
+## Core API
 
 ```go
-lifo := new(Lifo)
-closer1 := &MyCloser{}
-closer2 := io.NopCloser(nil)
-
-lifo.Append(closer1)
-lifo.Append(closer2)
-
-err := lifo.CloseContext(context.Background())
-fmt.Println(err)
-// Output: my closer error
+type ContextCloser interface {
+	CloseContext(context.Context) error
+}
 ```
 
-### Closing Resources with Context:
+Constructors:
 
-Employ the CloseContext method to facilitate resource shutdown with context backing:
+- `shutdown.NewLIFO()`
+- `shutdown.NewFIFO()`
+- `shutdown.NewGroup()`
+
+Helpers:
+
+- `shutdown.Fn`
+- `shutdown.ContextFn`
+- `shutdown.QuietFn`
+
+## Compatibility layer
+
+For package-level convenience, use `shutdown/compat`:
 
 ```go
-err := lifoCloser.CloseContext(ctx)
+compat.Set(shutdown.NewLIFO())
+compat.Append(server)
+compat.Append(db)
+
+waitCtx := context.Background()
+
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+if err := compat.CloseOnSignal(waitCtx, shutdownCtx, os.Interrupt, syscall.SIGTERM); err != nil {
+	log.Printf("compat shutdown failed: %v", err)
+}
 ```
 
-### Closing Resources without Context:
+`compat.CloseOnSignal` accepts separate contexts for waiting and shutdown so cancellation of the wait phase does not corrupt shutdown execution.
+`compat.WaitForSignal` requires at least one explicit signal.
+All compat functions that accept `context.Context` also require a non-nil context.
 
-To terminate resources absent context support, use the Close method:
+## Notes
 
-```go
-err := lifoCloser.Close()
-```
-
-## Dependencies
-
-* [go.uber.org/multierr](go.uber.org/multierr): A dependency used for amalgamating multiple errors into a unified error.
-
-## Recommendations
-
-Make sure you address any errors propagated by the Close or CloseContext functions to effectively manage any 
-complications that arise during the shutdown process.
+- repeated `Close` calls are idempotent and return the result of the first shutdown;
+- appending after shutdown starts is invalid and will panic;
+- `errors.Is` works with joined shutdown errors.

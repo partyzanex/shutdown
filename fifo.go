@@ -2,64 +2,100 @@ package shutdown
 
 import (
 	"context"
+	"errors"
 	"sync"
-
-	"go.uber.org/multierr"
 )
 
-// Fifo is a struct that manages a queue of resources that need to be closed, in First-In-First-Out order.
+// Fifo closes registered resources in first-in, first-out order.
+//
+// The first resource appended to the manager is the first resource closed during
+// shutdown. This strategy is useful when resources were acquired in the same
+// order they should be released, or when shutdown ordering should mirror the
+// application startup sequence rather than unwind it.
+//
+// Fifo is safe for concurrent Append and Close calls. Shutdown itself is
+// idempotent: the first call to Close or CloseContext performs the work, and
+// subsequent calls return the previously computed result.
 type Fifo struct {
-	queue []Closer   // The list of resources to close
-	mx    sync.Mutex // Mutex for thread safety
+	mu     sync.Mutex
+	once   sync.Once
+	closed bool
+	result error
+	queue  []Closer
 }
 
-// Append adds a new closer to the end of the Fifo queue.
+// NewFIFO constructs an empty FIFO shutdown manager.
+//
+// The returned value is ready for immediate use and does not require further
+// initialization.
+func NewFIFO() *Fifo {
+	return &Fifo{}
+}
+
+// Append registers a closer to be executed during shutdown.
+//
+// Nil closers are ignored. If shutdown has already started, Append panics,
+// because adding resources after the shutdown sequence has been fixed is treated
+// as a programming error in the current API.
 func (f *Fifo) Append(closer Closer) {
-	f.mx.Lock()         // Acquiring the lock
-	defer f.mx.Unlock() // Making sure to release the lock after the function exits
+	if closer == nil {
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.closed {
+		panic("shutdown: append after close")
+	}
+
 	f.queue = append(f.queue, closer)
 }
 
-// CloseContext attempts to close each resource in the Fifo queue with context support.
+// CloseContext starts FIFO shutdown using the supplied context.
+//
+// Each registered closer is executed in append order. Before running a new
+// closer, the manager checks ctx.Err(); if the context has already been
+// canceled, shutdown stops scheduling additional closers and the context error
+// is joined into the returned error.
+//
+// If a closer implements ContextCloser, CloseContext forwards ctx to that
+// method. Otherwise the manager falls back to Close.
+//
+// The first call performs shutdown and caches the result. Later calls return
+// the cached result without re-running any closers.
+//
+// ctx must be non-nil. Passing nil is considered a caller bug and may panic.
 func (f *Fifo) CloseContext(ctx context.Context) error {
-	f.mx.Lock()         // Acquiring the lock
-	defer f.mx.Unlock() // Making sure to release the lock after the function exits
+	f.once.Do(func() {
+		f.mu.Lock()
+		f.closed = true
+		closers := append([]Closer(nil), f.queue...)
+		f.queue = nil
+		f.mu.Unlock()
 
-	var errs error // This will store the accumulated errors
+		errs := make([]error, 0, len(closers)+1)
 
-	for _, closer := range f.queue {
-		next := make(chan struct{}) // Channel to signal completion of the closer
-		go func() {
-			callClose(closer, &errs) // Call the close function and gather errors if any
-			close(next)
-		}()
+		for _, closer := range closers {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				errs = appendContextError(errs, ctxErr)
+				break
+			}
 
-		select {
-		case <-ctx.Done():
-			// If the context is cancelled or times out, return the accumulated errors and the context error
-			return multierr.Append(errs, ctx.Err())
-		case <-next:
-			// Move to the next closer in the queue after the current one finishes
+			if err := closeWithContext(ctx, closer); err != nil {
+				errs = append(errs, err)
+			}
 		}
-	}
 
-	return errs // Return the accumulated errors
+		f.result = errors.Join(errs...)
+	})
+
+	return f.result
 }
 
-// Close attempts to close all resources in the Fifo queue without context support.
+// Close starts FIFO shutdown with context.Background().
+//
+// It is equivalent to calling CloseContext(context.Background()).
 func (f *Fifo) Close() error {
-	return f.CloseContext(context.Background()) // Using a background context which will never be cancelled
-}
-
-// WithContext associates the Fifo instance with the given context.
-// It utilizes the ClosureToContext function to store the Fifo instance as a Closure within the context.
-func (f *Fifo) WithContext(ctx context.Context) context.Context {
-	return ClosureToContext(ctx, f)
-}
-
-// callClose safely calls the Close method of the given closer and appends any errors.
-func callClose(closer Closer, errs *error) {
-	if err := closer.Close(); err != nil {
-		*errs = multierr.Append(*errs, err) // Accumulate the error if Close method fails
-	}
+	return f.CloseContext(context.Background())
 }

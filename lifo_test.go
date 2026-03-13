@@ -3,71 +3,65 @@ package shutdown
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestLifoCloseContext(t *testing.T) {
-	lifo := &Lifo{}
+func TestLIFOClosesInReverseAppendOrder(t *testing.T) {
+	lifo := NewLIFO()
+	var order []string
+	expected := errors.New("second failed")
 
-	first := &mockCloser{closeFunc: func() error { return nil }}
-	second := &mockCloser{closeFunc: func() error { return errors.New("second error") }}
-	third := &mockCloser{closeFunc: func() error { return nil }}
-
-	lifo.Append(first)
-	lifo.Append(second)
-	lifo.Append(third)
-
-	err := lifo.CloseContext(context.Background())
-	assert.NotNil(t, err)
-	assert.Contains(t, err.Error(), "second error")
-
-	lifo = &Lifo{}
-	timeoutCloser := &mockCloser{closeFunc: func() error {
-		time.Sleep(2 * time.Second)
+	lifo.Append(Fn(func() error {
+		order = append(order, "first")
 		return nil
-	}}
-
-	lifo.Append(timeoutCloser)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	err = lifo.CloseContext(ctx)
-	assert.NotNil(t, err)
-	assert.True(t, errors.Is(err, context.DeadlineExceeded))
-}
-
-func TestLifoClose(t *testing.T) {
-	lifo := &Lifo{}
-
-	first := &mockCloser{closeFunc: func() error { return nil }}
-	second := &mockCloser{closeFunc: func() error { return errors.New("second error") }}
-
-	lifo.Append(first)
-	lifo.Append(second)
+	}))
+	lifo.Append(Fn(func() error {
+		order = append(order, "second")
+		return expected
+	}))
 
 	err := lifo.Close()
-	assert.NotNil(t, err)
-	assert.Contains(t, err.Error(), "second error")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, expected)
+
+	assert.True(t, reflect.DeepEqual(order, []string{"second", "first"}), "unexpected close order: %v", order)
 }
 
-func TestLifo_WithContext(t *testing.T) {
-	l := &Lifo{}
+func TestLIFOUsesContextCloser(t *testing.T) {
+	lifo := NewLIFO()
+	expected := context.Canceled
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
-	// Embed the Lifo instance into a new context.
-	newCtx := l.WithContext(context.Background())
+	lifo.Append(ContextFn(func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}))
 
-	// Retrieve the Lifo instance (as a Closure) from the new context.
-	extractedClosure, ok := ClosureFromContext(newCtx)
+	err := lifo.CloseContext(ctx)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, expected)
+}
 
-	if !ok {
-		t.Fatalf("Expected to find a closure in the context, but found none.")
-	}
+func TestLIFOAppendIgnoresNilCloser(t *testing.T) {
+	lifo := NewLIFO()
 
-	// Type assert the extracted closure to *Lifo to verify it's the correct type.
-	if _, isLifo := extractedClosure.(*Lifo); !isLifo {
-		t.Fatalf("Expected the closure in context to be of type *Lifo, but it's not.")
-	}
+	assert.NotPanics(t, func() {
+		lifo.Append(nil)
+	})
+
+	assert.Empty(t, lifo.stack)
+}
+
+func TestLIFOAppendPanicsAfterClose(t *testing.T) {
+	lifo := NewLIFO()
+
+	require.NoError(t, lifo.Close())
+	require.PanicsWithValue(t, "shutdown: append after close", func() {
+		lifo.Append(Fn(func() error { return nil }))
+	})
 }

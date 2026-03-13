@@ -2,83 +2,90 @@ package shutdown
 
 import (
 	"context"
+	"errors"
 	"sync"
-
-	"go.uber.org/multierr"
 )
 
-// Group represents a collection of resources that need to be closed.
+// Group closes registered resources concurrently.
+//
+// Unlike Fifo and Lifo, Group does not impose an ordering relationship between
+// registered closers. All closers are started in parallel during shutdown, and
+// the manager waits for every started closer to finish before returning.
+//
+// Group is useful when shutdown steps are independent and serial execution would
+// only increase total shutdown latency.
 type Group struct {
-	closers []Closer   // The list of resources to close.
-	mx      sync.Mutex // Mutex for thread safety.
+	mu      sync.Mutex
+	once    sync.Once
+	closed  bool
+	result  error
+	closers []Closer
 }
 
-// Append adds a new closer to the Group's list of closers.
+// NewGroup constructs an empty concurrent shutdown manager.
+func NewGroup() *Group {
+	return &Group{}
+}
+
+// Append registers a closer to be executed during shutdown.
+//
+// Nil closers are ignored. Appending after shutdown has started panics.
 func (g *Group) Append(closer Closer) {
-	g.mx.Lock()         // Acquire the lock to ensure thread safety.
-	defer g.mx.Unlock() // Release the lock after the function finishes.
+	if closer == nil {
+		return
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.closed {
+		panic("shutdown: append after close")
+	}
+
 	g.closers = append(g.closers, closer)
 }
 
-// CloseContext attempts to close each resource in the Group with context support.
-// This allows external cancellation or timeout to be handled.
+// CloseContext starts concurrent shutdown using the supplied context.
+//
+// All registered closers are launched concurrently. If a closer implements
+// ContextCloser, it receives the supplied context; otherwise Close is used.
+//
+// Group differs intentionally from the sequential managers: it waits for all
+// started closers to finish even if ctx becomes done while shutdown is running.
+// After all goroutines complete, any observed closer errors are joined together,
+// and the context error is appended if present.
+//
+// Shutdown is performed only once. Later calls return the cached result.
+//
+// ctx must be non-nil. Passing nil is considered a caller bug and may panic.
 func (g *Group) CloseContext(ctx context.Context) error {
-	g.mx.Lock()         // Acquire the lock to ensure thread safety.
-	defer g.mx.Unlock() // Release the lock after the function finishes.
+	g.once.Do(func() {
+		g.mu.Lock()
+		g.closed = true
+		closers := append([]Closer(nil), g.closers...)
+		g.closers = nil
+		g.mu.Unlock()
 
-	// Prepare a slice to store errors from all the closers.
-	var (
-		errs = make([]error, 0, len(g.closers))
-		mx   sync.Mutex // Local mutex for the error slice, to ensure thread safety while appending errors.
-	)
+		errs := make([]error, len(closers))
+		var wg sync.WaitGroup
 
-	wg := sync.WaitGroup{} // WaitGroup to wait for all closers to finish.
-	wg.Add(len(g.closers))
+		wg.Add(len(closers))
+		for i, closer := range closers {
+			go func(index int, closer Closer) {
+				defer wg.Done()
+				errs[index] = closeWithContext(ctx, closer)
+			}(i, closer)
+		}
 
-	// Iterate through each closer in the Group.
-	for _, closer := range g.closers {
-		go func(c Closer) {
-			done := make(chan struct{}) // Channel to signal when the closer finishes.
+		wg.Wait()
+		errs = appendContextError(errs, ctx.Err())
+		g.result = errors.Join(errs...)
+	})
 
-			// Inner goroutine to call the Close method of the resource.
-			go func() {
-				if err := c.Close(); err != nil {
-					mx.Lock()
-					errs = append(errs, err) // If there's an error, append it to the errs slice.
-					mx.Unlock()
-				}
-
-				close(done) // Signal that the closer is done.
-			}()
-
-			select {
-			case <-ctx.Done(): // If the context is cancelled or times out.
-			case <-done: // Wait until the closer finishes.
-			}
-
-			wg.Done() // Signal that this goroutine is finished.
-		}(closer)
-	}
-
-	wg.Wait() // Wait until all closers are finished.
-
-	// Combine all the errors into a single error using multierr.
-	return multierr.Combine(errs...)
+	return g.result
 }
 
-// Close attempts to close all resources in the Group without context support.
+// Close starts concurrent shutdown with context.Background().
 func (g *Group) Close() error {
-	return g.CloseContext(context.Background()) // Use a default background context.
-}
-
-// WithContext associates the Group instance with the provided context.
-// It uses the ClosureToContext function to embed the group into the context.
-//
-// Parameters:
-// - ctx: The context to which the Group instance will be associated.
-//
-// Returns:
-// - A new context containing the Group instance.
-func (g *Group) WithContext(ctx context.Context) context.Context {
-	return ClosureToContext(ctx, g)
+	return g.CloseContext(context.Background())
 }

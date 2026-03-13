@@ -3,173 +3,150 @@ package shutdown
 import (
 	"context"
 	"errors"
-	"fmt"
-	"os"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-type pkgCloser struct {
-	mu      sync.Mutex
-	isClose bool
-	err     error
+type testContextCloser struct {
+	closeCalled        int
+	closeContextCalled int
+	lastContext        context.Context
+	closeErr           error
+	closeContextErr    error
 }
 
-func (mc *pkgCloser) Close() error {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
-	mc.isClose = true
-	return mc.err
+func (c *testContextCloser) Close() error {
+	c.closeCalled++
+	return c.closeErr
 }
 
-func TestAppendAndClose(t *testing.T) {
-	SetPackageClosure(&Lifo{})
-	once = sync.Once{}
-	mCloser := &pkgCloser{}
-	Append(mCloser)
-	if err := Close(); err != nil || !mCloser.isClose {
-		t.Fatalf("Expected closer to be closed without errors, got: %v", err)
-	}
+func (c *testContextCloser) CloseContext(ctx context.Context) error {
+	c.closeContextCalled++
+	c.lastContext = ctx
+	return c.closeContextErr
 }
 
-func TestAppendFnAndClose(t *testing.T) {
-	SetPackageClosure(&Lifo{})
-	once = sync.Once{}
-	mCloser := &pkgCloser{}
-	Append(Fn(mCloser.Close))
-	if err := Close(); err != nil || !mCloser.isClose {
-		t.Fatalf("Expected closer to be closed without errors, got: %v", err)
-	}
+type testCloser struct {
+	called int
+	err    error
 }
 
-type quietCloser struct {
-	mu      sync.Mutex
-	isClose bool
+func (c *testCloser) Close() error {
+	c.called++
+	return c.err
 }
 
-func (mc *quietCloser) Close() {
-	mc.mu.Lock()
-	mc.isClose = true
-	mc.mu.Unlock()
+func TestFnClose(t *testing.T) {
+	expected := errors.New("fn failed")
+	calls := 0
+
+	closer := Fn(func() error {
+		calls++
+		return expected
+	})
+
+	err := closer.Close()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, expected)
+	assert.Equal(t, 1, calls)
 }
 
-func TestAppendQuietAndClose(t *testing.T) {
-	SetPackageClosure(&Lifo{})
-	once = sync.Once{}
-	mCloser := &quietCloser{}
-	AppendQuiet(mCloser)
-	if err := Close(); err != nil || !mCloser.isClose {
-		t.Fatalf("Expected closer to be closed without errors, got: %v", err)
-	}
-}
-
-func TestAppendAndCloseWithError(t *testing.T) {
-	SetPackageClosure(&Fifo{})
-	once = sync.Once{}
-	expectedErr := errors.New("close error")
-	mCloser := &pkgCloser{err: expectedErr}
-	Append(mCloser)
-	if err := Close(); err == nil || err.Error() != expectedErr.Error() {
-		t.Fatalf("Expected error: %v, got: %v", expectedErr, err)
-	}
-}
-
-type mockLogger struct {
-	messages []string
-	mu       sync.Mutex
-}
-
-func (ml *mockLogger) Msgf(format string, args ...interface{}) {
-	ml.mu.Lock()
-	defer ml.mu.Unlock()
-
-	ml.messages = append(ml.messages, fmt.Sprintf(format, args...))
-}
-
-func TestWaitForSignals(t *testing.T) {
-	ml := &mockLogger{}
-	signals := []os.Signal{os.Interrupt}
-
-	go func() {
-		// Simulate a signal after a short delay
-		time.Sleep(100 * time.Millisecond)
-		process, _ := os.FindProcess(os.Getpid())
-		_ = process.Signal(os.Interrupt)
-	}()
-
-	WaitForSignals(ml, signals...)
-
-	if len(ml.messages) == 0 || ml.messages[0] != "Received signal: interrupt" {
-		t.Errorf("Expected log message about received signal, got: %v", ml.messages)
-	}
-}
-
-func TestWaitForSignalsContext(t *testing.T) {
-	ml := &mockLogger{}
-	signals := []os.Signal{os.Interrupt}
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
-	WaitForSignalsContext(ctx, ml, signals...)
-
-	if len(ml.messages) == 0 || ml.messages[0] != "Received signal: context deadline exceeded" {
-		t.Errorf("Expected log message about context deadline, got: %v", ml.messages)
-	}
-}
-
-func TestFn_Close(t *testing.T) {
-	c := Fn(func() error {
+func TestContextFnCloseUsesBackgroundContext(t *testing.T) {
+	calls := 0
+	closer := ContextFn(func(ctx context.Context) error {
+		calls++
+		assert.NotNil(t, ctx)
+		assert.NoError(t, ctx.Err())
 		return nil
 	})
-	if err := c.Close(); err != nil {
-		t.Errorf("Expected no error, got: %v", err)
-	}
+
+	err := closer.Close()
+	require.NoError(t, err)
+	assert.Equal(t, 1, calls)
 }
 
-func getLastLoggedMessage(ml *mockLogger) string {
-	ml.mu.Lock()
-	defer ml.mu.Unlock()
-
-	if len(ml.messages) == 0 {
-		return ""
-	}
-
-	return ml.messages[len(ml.messages)-1]
-}
-
-func TestCloseOnSignal(t *testing.T) {
-	logger := &mockLogger{}
-
-	go func() {
-		// Simulate a signal after a short delay
-		time.Sleep(100 * time.Millisecond)
-		process, _ := os.FindProcess(os.Getpid())
-		_ = process.Signal(os.Interrupt)
-	}()
-
-	// Normally, you'd want to simulate the actual os.Signal here, but this example
-	// just checks if the logger logs the message.
-	err := CloseOnSignal(logger, os.Interrupt)
-	assert.NoError(t, err)
-
-	assert.Equal(t, "Received signal: interrupt", getLastLoggedMessage(logger))
-}
-
-func TestCloseOnSignalContextCancelled(t *testing.T) {
-	logger := &mockLogger{}
+func TestContextFnCloseContextPassesProvidedContext(t *testing.T) {
+	expected := context.Canceled
 	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
-	// Simulate context completion without waiting for the actual os.Signal.
-	go func() {
-		cancel()
-	}()
+	calls := 0
+	closer := ContextFn(func(got context.Context) error {
+		calls++
+		assert.Same(t, ctx, got)
+		return got.Err()
+	})
 
-	err := CloseOnSignalContext(ctx, logger, os.Interrupt)
-	assert.NoError(t, err)
+	err := closer.CloseContext(ctx)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, expected)
+	assert.Equal(t, 1, calls)
+}
 
-	assert.Equal(t, "Received signal: context canceled", getLastLoggedMessage(logger))
+func TestQuietFnClose(t *testing.T) {
+	calls := 0
+	closer := QuietFn(func() {
+		calls++
+	})
+
+	err := closer.Close()
+	require.NoError(t, err)
+	assert.Equal(t, 1, calls)
+}
+
+func TestCloseWithContext(t *testing.T) {
+	expected := errors.New("context close failed")
+	ctx := context.WithValue(context.Background(), struct{}{}, "marker")
+
+	t.Run("nil closer", func(t *testing.T) {
+		assert.NoError(t, closeWithContext(ctx, nil))
+	})
+
+	t.Run("context closer uses CloseContext", func(t *testing.T) {
+		closer := &testContextCloser{closeErr: errors.New("plain close"), closeContextErr: expected}
+
+		err := closeWithContext(ctx, closer)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, expected)
+		assert.Equal(t, 0, closer.closeCalled)
+		assert.Equal(t, 1, closer.closeContextCalled)
+		assert.Same(t, ctx, closer.lastContext)
+	})
+
+	t.Run("plain closer falls back to Close", func(t *testing.T) {
+		closer := &testCloser{err: expected}
+
+		err := closeWithContext(ctx, closer)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, expected)
+		assert.Equal(t, 1, closer.called)
+	})
+}
+
+func TestAppendContextError(t *testing.T) {
+	ctxErr := context.Canceled
+	otherErr := errors.New("other")
+
+	t.Run("nil context error keeps slice unchanged", func(t *testing.T) {
+		errs := []error{otherErr}
+		got := appendContextError(errs, nil)
+		assert.Equal(t, errs, got)
+	})
+
+	t.Run("new context error is appended", func(t *testing.T) {
+		errs := []error{otherErr}
+		got := appendContextError(errs, ctxErr)
+		require.Len(t, got, 2)
+		assert.ErrorIs(t, errors.Join(got...), otherErr)
+		assert.ErrorIs(t, errors.Join(got...), ctxErr)
+	})
+
+	t.Run("existing joined context error is not duplicated", func(t *testing.T) {
+		errs := []error{errors.Join(otherErr, ctxErr)}
+		got := appendContextError(errs, ctxErr)
+		require.Len(t, got, 1)
+		assert.Same(t, errs[0], got[0])
+	})
 }
