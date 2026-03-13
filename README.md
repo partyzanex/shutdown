@@ -29,7 +29,7 @@ if err := manager.CloseContext(ctx); err != nil {
 }
 ```
 
-Package-level convenience APIs live in `shutdown/compat`. They exist for compatibility and simple wiring, but new code should prefer instance-based managers from the root package.
+For code that prefers package-level wiring, `shutdown/compat` provides a shared manager behind package-level functions. New code should still prefer explicit manager instances from the root package when possible.
 
 ## Context semantics
 
@@ -63,7 +63,7 @@ Helpers:
 - `shutdown.ContextFn`
 - `shutdown.QuietFn`
 
-## Compatibility layer
+## Package-level API
 
 For package-level convenience, use `shutdown/compat`:
 
@@ -82,9 +82,10 @@ if err := compat.CloseOnSignal(waitCtx, shutdownCtx, os.Interrupt, syscall.SIGTE
 }
 ```
 
+`shutdown/compat` provides a package-level API backed by a shared manager.
 `compat.CloseOnSignal` accepts separate contexts for waiting and shutdown so cancellation of the wait phase does not corrupt shutdown execution.
 `compat.WaitForSignal` requires at least one explicit signal.
-All compat functions that accept `context.Context` also require a non-nil context.
+All `compat` functions that accept `context.Context` also require a non-nil context.
 
 ## Notes
 
