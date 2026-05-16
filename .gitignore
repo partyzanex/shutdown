@@ -7,3 +7,4 @@ vendor/
 *.log
 coverage.txt
 coverage.xml
+.serena/

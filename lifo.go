@@ -14,34 +14,66 @@ import (
 //
 // Lifo is safe for concurrent use and performs shutdown at most once.
 type Lifo struct {
-	mu     sync.Mutex
-	once   sync.Once
-	closed bool
-	result error
-	stack  []Closer
+	mu         sync.Mutex
+	once       sync.Once
+	closed     bool
+	result     error
+	stack      []Closer
+	errHandler func(error)
 }
 
 // NewLIFO constructs an empty LIFO shutdown manager.
-func NewLIFO() *Lifo {
-	return &Lifo{}
+func NewLIFO(opts ...Option) *Lifo {
+	o := applyOptions(opts)
+	return &Lifo{errHandler: o.errHandler}
 }
 
 // Append registers a closer to be executed during shutdown.
 //
-// Nil closers are ignored. Appending after shutdown has started panics.
+// Nil closers are ignored. If shutdown has already started, the closer is
+// closed inline via its Close method and any returned error is discarded.
+// This makes Append safe to call from concurrent initialization paths that
+// may race with an incoming signal.
 func (l *Lifo) Append(closer Closer) {
 	if closer == nil {
 		return
 	}
 
 	l.mu.Lock()
+	if l.closed {
+		errHandler := l.errHandler
+		l.mu.Unlock()
+
+		if err := closer.Close(); err != nil && errHandler != nil {
+			errHandler(err)
+		}
+
+		return
+	}
+	l.stack = append(l.stack, closer)
+	l.mu.Unlock()
+}
+
+// TryAppend registers a closer to be executed during shutdown.
+//
+// Unlike Append, TryAppend returns ErrClosed instead of closing the resource
+// inline when shutdown has already started. The caller decides what to do with
+// the unregistered closer. Nil closers are ignored and nil is returned.
+func (l *Lifo) TryAppend(closer Closer) error {
+	if closer == nil {
+		return nil
+	}
+
+	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if l.closed {
-		panic("shutdown: append after close")
+		return ErrClosed
 	}
 
 	l.stack = append(l.stack, closer)
+
+	return nil
 }
 
 // CloseContext starts LIFO shutdown using the supplied context.
