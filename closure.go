@@ -3,8 +3,21 @@ package shutdown
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"runtime/debug"
 )
+
+// ErrClosed is returned by TryAppend when the manager has already started
+// shutdown. Callers that need to distinguish this case from other errors can
+// use errors.Is(err, ErrClosed).
+var ErrClosed = errors.New("shutdown: manager already closed")
+
+// ErrPanic is reported by managers when a registered closer panics during
+// shutdown. The recovered value is wrapped into the returned error so that
+// callers can detect a panic via errors.Is(err, ErrPanic) while still
+// retaining the original cause when it was itself an error.
+var ErrPanic = errors.New("shutdown: panic in closer")
 
 // Closer is the minimal contract accepted by shutdown managers.
 //
@@ -32,10 +45,44 @@ type ContextCloser interface {
 // QuietCloser is a convenience contract for resources whose shutdown operation
 // cannot fail.
 //
-// The compat layer can wrap a QuietCloser into a regular Closer by adapting its
-// Close method to return a nil error.
+// QuietCloser is used by the shutdown/compat package (AppendQuiet). The core
+// managers do not type-assert for QuietCloser; use QuietFn to register a
+// no-error function directly with a manager.
 type QuietCloser interface {
 	Close()
+}
+
+// Option configures a shutdown manager at construction time.
+type Option func(*options)
+
+type options struct {
+	errHandler func(error)
+}
+
+func applyOptions(opts []Option) options {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	return o
+}
+
+// WithErrHandler sets a callback invoked when Append closes a resource inline
+// because shutdown has already started. The error from that inline Close call
+// is passed to fn. Without this option such errors are silently discarded.
+func WithErrHandler(fn func(error)) Option {
+	return func(o *options) {
+		o.errHandler = fn
+	}
+}
+
+// Appender is implemented by managers that support explicit registration with
+// error reporting. Unlike the Append method on Manager, TryAppend returns
+// ErrClosed when shutdown has already started instead of closing the resource
+// inline, giving the caller full control over the unregistered resource.
+type Appender interface {
+	TryAppend(closer Closer) error
 }
 
 // Manager is the common contract implemented by all shutdown strategies.
@@ -123,10 +170,26 @@ func (f QuietFn) Close() error {
 //
 // A nil closer is treated as a no-op to keep manager implementations simple when
 // they need to handle optional registrations.
-func closeWithContext(ctx context.Context, closer Closer) error {
+func closeWithContext(ctx context.Context, closer Closer) (err error) {
 	if closer == nil {
 		return nil
 	}
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+
+		stack := debug.Stack()
+
+		if recoveredErr, ok := r.(error); ok {
+			err = fmt.Errorf("%w: %w\n%s", ErrPanic, recoveredErr, stack)
+			return
+		}
+
+		err = fmt.Errorf("%w: %v\n%s", ErrPanic, r, stack)
+	}()
 
 	if contextCloser, ok := closer.(ContextCloser); ok {
 		return contextCloser.CloseContext(ctx)

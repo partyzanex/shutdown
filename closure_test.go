@@ -96,9 +96,11 @@ func TestQuietFnClose(t *testing.T) {
 	assert.Equal(t, 1, calls)
 }
 
+type testCtxKey struct{}
+
 func TestCloseWithContext(t *testing.T) {
 	expected := errors.New("context close failed")
-	ctx := context.WithValue(context.Background(), struct{}{}, "marker")
+	ctx := context.WithValue(context.Background(), testCtxKey{}, "marker")
 
 	t.Run("nil closer", func(t *testing.T) {
 		assert.NoError(t, closeWithContext(ctx, nil))
@@ -122,6 +124,89 @@ func TestCloseWithContext(t *testing.T) {
 		require.Error(t, err)
 		assert.ErrorIs(t, err, expected)
 		assert.Equal(t, 1, closer.called)
+	})
+}
+
+func TestWithErrHandler(t *testing.T) {
+	closeErr := errors.New("close failed")
+
+	t.Run("LIFO calls handler when inline-close errors", func(t *testing.T) {
+		var got error
+		lifo := NewLIFO(WithErrHandler(func(err error) { got = err }))
+		require.NoError(t, lifo.Close())
+
+		lifo.Append(Fn(func() error { return closeErr }))
+		assert.ErrorIs(t, got, closeErr)
+	})
+
+	t.Run("FIFO calls handler when inline-close errors", func(t *testing.T) {
+		var got error
+		fifo := NewFIFO(WithErrHandler(func(err error) { got = err }))
+		require.NoError(t, fifo.Close())
+
+		fifo.Append(Fn(func() error { return closeErr }))
+		assert.ErrorIs(t, got, closeErr)
+	})
+
+	t.Run("Group calls handler when inline-close errors", func(t *testing.T) {
+		var got error
+		group := NewGroup(WithErrHandler(func(err error) { got = err }))
+		require.NoError(t, group.Close())
+
+		group.Append(Fn(func() error { return closeErr }))
+		assert.ErrorIs(t, got, closeErr)
+	})
+
+	t.Run("no handler: nil error discarded silently", func(t *testing.T) {
+		lifo := NewLIFO()
+		require.NoError(t, lifo.Close())
+
+		assert.NotPanics(t, func() {
+			lifo.Append(Fn(func() error { return closeErr }))
+		})
+	})
+}
+
+func TestAppenderInterface(t *testing.T) {
+	// Compile-time check: all three managers implement Appender.
+	var _ Appender = NewLIFO()
+	var _ Appender = NewFIFO()
+	var _ Appender = NewGroup()
+
+	lifo := NewLIFO()
+	require.NoError(t, lifo.Close())
+
+	var ap Appender = lifo
+	err := ap.TryAppend(Fn(func() error { return nil }))
+	assert.ErrorIs(t, err, ErrClosed)
+}
+
+func TestCloseWithContextRecoversPanic(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("plain closer panics with error value", func(t *testing.T) {
+		boom := errors.New("boom")
+		closer := Fn(func() error { panic(boom) })
+
+		err := closeWithContext(ctx, closer)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrPanic)
+		assert.ErrorIs(t, err, boom)
+		assert.Contains(t, err.Error(), "goroutine", "stack trace must be included")
+	})
+
+	t.Run("context closer panics with string value", func(t *testing.T) {
+		closer := ContextFn(func(context.Context) error { panic("kaboom") })
+
+		err := closeWithContext(ctx, closer)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrPanic)
+		assert.Contains(t, err.Error(), "kaboom")
+		assert.Contains(t, err.Error(), "goroutine", "stack trace must be included")
+	})
+
+	t.Run("nil closer does not panic", func(t *testing.T) {
+		assert.NoError(t, closeWithContext(ctx, nil))
 	})
 }
 

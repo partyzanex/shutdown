@@ -17,39 +17,69 @@ import (
 // idempotent: the first call to Close or CloseContext performs the work, and
 // subsequent calls return the previously computed result.
 type Fifo struct {
-	mu     sync.Mutex
-	once   sync.Once
-	closed bool
-	result error
-	queue  []Closer
+	mu         sync.Mutex
+	once       sync.Once
+	closed     bool
+	result     error
+	queue      []Closer
+	errHandler func(error)
 }
 
 // NewFIFO constructs an empty FIFO shutdown manager.
 //
 // The returned value is ready for immediate use and does not require further
 // initialization.
-func NewFIFO() *Fifo {
-	return &Fifo{}
+func NewFIFO(opts ...Option) *Fifo {
+	o := applyOptions(opts)
+	return &Fifo{errHandler: o.errHandler}
 }
 
 // Append registers a closer to be executed during shutdown.
 //
-// Nil closers are ignored. If shutdown has already started, Append panics,
-// because adding resources after the shutdown sequence has been fixed is treated
-// as a programming error in the current API.
+// Nil closers are ignored. If shutdown has already started, the closer is
+// closed inline via its Close method and any returned error is discarded.
+// This makes Append safe to call from concurrent initialization paths that
+// may race with an incoming signal.
 func (f *Fifo) Append(closer Closer) {
 	if closer == nil {
 		return
 	}
 
 	f.mu.Lock()
+	if f.closed {
+		errHandler := f.errHandler
+		f.mu.Unlock()
+
+		if err := closer.Close(); err != nil && errHandler != nil {
+			errHandler(err)
+		}
+
+		return
+	}
+	f.queue = append(f.queue, closer)
+	f.mu.Unlock()
+}
+
+// TryAppend registers a closer to be executed during shutdown.
+//
+// Unlike Append, TryAppend returns ErrClosed instead of closing the resource
+// inline when shutdown has already started. The caller decides what to do with
+// the unregistered closer. Nil closers are ignored and nil is returned.
+func (f *Fifo) TryAppend(closer Closer) error {
+	if closer == nil {
+		return nil
+	}
+
+	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	if f.closed {
-		panic("shutdown: append after close")
+		return ErrClosed
 	}
 
 	f.queue = append(f.queue, closer)
+
+	return nil
 }
 
 // CloseContext starts FIFO shutdown using the supplied context.

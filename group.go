@@ -15,34 +15,66 @@ import (
 // Group is useful when shutdown steps are independent and serial execution would
 // only increase total shutdown latency.
 type Group struct {
-	mu      sync.Mutex
-	once    sync.Once
-	closed  bool
-	result  error
-	closers []Closer
+	mu         sync.Mutex
+	once       sync.Once
+	closed     bool
+	result     error
+	closers    []Closer
+	errHandler func(error)
 }
 
 // NewGroup constructs an empty concurrent shutdown manager.
-func NewGroup() *Group {
-	return &Group{}
+func NewGroup(opts ...Option) *Group {
+	o := applyOptions(opts)
+	return &Group{errHandler: o.errHandler}
 }
 
 // Append registers a closer to be executed during shutdown.
 //
-// Nil closers are ignored. Appending after shutdown has started panics.
+// Nil closers are ignored. If shutdown has already started, the closer is
+// closed inline via its Close method and any returned error is discarded.
+// This makes Append safe to call from concurrent initialization paths that
+// may race with an incoming signal.
 func (g *Group) Append(closer Closer) {
 	if closer == nil {
 		return
 	}
 
 	g.mu.Lock()
+	if g.closed {
+		errHandler := g.errHandler
+		g.mu.Unlock()
+
+		if err := closer.Close(); err != nil && errHandler != nil {
+			errHandler(err)
+		}
+
+		return
+	}
+	g.closers = append(g.closers, closer)
+	g.mu.Unlock()
+}
+
+// TryAppend registers a closer to be executed during shutdown.
+//
+// Unlike Append, TryAppend returns ErrClosed instead of closing the resource
+// inline when shutdown has already started. The caller decides what to do with
+// the unregistered closer. Nil closers are ignored and nil is returned.
+func (g *Group) TryAppend(closer Closer) error {
+	if closer == nil {
+		return nil
+	}
+
+	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	if g.closed {
-		panic("shutdown: append after close")
+		return ErrClosed
 	}
 
 	g.closers = append(g.closers, closer)
+
+	return nil
 }
 
 // CloseContext starts concurrent shutdown using the supplied context.
@@ -50,10 +82,11 @@ func (g *Group) Append(closer Closer) {
 // All registered closers are launched concurrently. If a closer implements
 // ContextCloser, it receives the supplied context; otherwise Close is used.
 //
-// Group differs intentionally from the sequential managers: it waits for all
-// started closers to finish even if ctx becomes done while shutdown is running.
-// After all goroutines complete, any observed closer errors are joined together,
-// and the context error is appended if present.
+// CloseContext honors ctx as a deadline: if ctx is done before every closer
+// has finished, the call returns with the errors collected so far plus the
+// context error joined in. Closers that have not yet completed are left
+// running in the background; their eventual errors are discarded. This makes
+// Group safe to use in shutdown paths that must respect a hard time budget.
 //
 // Shutdown is performed only once. Later calls return the cached result.
 //
@@ -66,20 +99,41 @@ func (g *Group) CloseContext(ctx context.Context) error {
 		g.closers = nil
 		g.mu.Unlock()
 
-		errs := make([]error, len(closers))
-		var wg sync.WaitGroup
+		var (
+			errsMu sync.Mutex
+			errs   = make([]error, 0, len(closers)+1)
+			wg     sync.WaitGroup
+		)
 
 		wg.Add(len(closers))
-		for i, closer := range closers {
-			go func(index int, closer Closer) {
+		for _, closer := range closers {
+			go func(closer Closer) {
 				defer wg.Done()
-				errs[index] = closeWithContext(ctx, closer)
-			}(i, closer)
+				if err := closeWithContext(ctx, closer); err != nil {
+					errsMu.Lock()
+					errs = append(errs, err)
+					errsMu.Unlock()
+				}
+			}(closer)
 		}
 
-		wg.Wait()
-		errs = appendContextError(errs, ctx.Err())
-		g.result = errors.Join(errs...)
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+
+		errsMu.Lock()
+		snapshot := append([]error(nil), errs...)
+		errsMu.Unlock()
+
+		snapshot = appendContextError(snapshot, ctx.Err())
+		g.result = errors.Join(snapshot...)
 	})
 
 	return g.result

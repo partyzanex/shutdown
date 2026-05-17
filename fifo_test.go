@@ -78,11 +78,53 @@ func TestFIFOAppendIgnoresNilCloser(t *testing.T) {
 	assert.Empty(t, fifo.queue)
 }
 
-func TestFIFOAppendPanicsAfterClose(t *testing.T) {
+func TestFIFORecoversPanicAndContinues(t *testing.T) {
 	fifo := NewFIFO()
+	second := &testCloser{}
 
-	require.NoError(t, fifo.Close())
-	require.PanicsWithValue(t, "shutdown: append after close", func() {
-		fifo.Append(Fn(func() error { return nil }))
+	fifo.Append(Fn(func() error { panic("boom") }))
+	fifo.Append(second)
+
+	err := fifo.Close()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPanic)
+	assert.Equal(t, 1, second.called)
+}
+
+func TestFIFOTryAppend(t *testing.T) {
+	t.Run("open manager accepts closer", func(t *testing.T) {
+		fifo := NewFIFO()
+		err := fifo.TryAppend(Fn(func() error { return nil }))
+		require.NoError(t, err)
+		assert.Len(t, fifo.queue, 1)
 	})
+
+	t.Run("closed manager returns ErrClosed without running closer", func(t *testing.T) {
+		fifo := NewFIFO()
+		require.NoError(t, fifo.Close())
+
+		late := &testCloser{}
+		err := fifo.TryAppend(late)
+		require.ErrorIs(t, err, ErrClosed)
+		assert.Equal(t, 0, late.called)
+	})
+
+	t.Run("nil closer is no-op", func(t *testing.T) {
+		fifo := NewFIFO()
+		assert.NoError(t, fifo.TryAppend(nil))
+	})
+}
+
+func TestFIFOAppendAfterCloseRunsCloserInline(t *testing.T) {
+	fifo := NewFIFO()
+	require.NoError(t, fifo.Close())
+
+	late := &testCloser{}
+
+	require.NotPanics(t, func() {
+		fifo.Append(late)
+	})
+
+	assert.Equal(t, 1, late.called, "late closer must be closed inline")
+	assert.Empty(t, fifo.queue, "late closer must not be stored")
 }

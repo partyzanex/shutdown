@@ -57,11 +57,55 @@ func TestLIFOAppendIgnoresNilCloser(t *testing.T) {
 	assert.Empty(t, lifo.stack)
 }
 
-func TestLIFOAppendPanicsAfterClose(t *testing.T) {
+func TestLIFORecoversPanicAndContinues(t *testing.T) {
 	lifo := NewLIFO()
+	first := &testCloser{}
 
-	require.NoError(t, lifo.Close())
-	require.PanicsWithValue(t, "shutdown: append after close", func() {
-		lifo.Append(Fn(func() error { return nil }))
+	// LIFO: appended first → closed last. We want to ensure that a panic
+	// in the most-recently-appended closer does not stop the earlier one.
+	lifo.Append(first)
+	lifo.Append(Fn(func() error { panic("boom") }))
+
+	err := lifo.Close()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPanic)
+	assert.Equal(t, 1, first.called)
+}
+
+func TestLIFOTryAppend(t *testing.T) {
+	t.Run("open manager accepts closer", func(t *testing.T) {
+		lifo := NewLIFO()
+		err := lifo.TryAppend(Fn(func() error { return nil }))
+		require.NoError(t, err)
+		assert.Len(t, lifo.stack, 1)
 	})
+
+	t.Run("closed manager returns ErrClosed without running closer", func(t *testing.T) {
+		lifo := NewLIFO()
+		require.NoError(t, lifo.Close())
+
+		late := &testCloser{}
+		err := lifo.TryAppend(late)
+		require.ErrorIs(t, err, ErrClosed)
+		assert.Equal(t, 0, late.called)
+	})
+
+	t.Run("nil closer is no-op", func(t *testing.T) {
+		lifo := NewLIFO()
+		assert.NoError(t, lifo.TryAppend(nil))
+	})
+}
+
+func TestLIFOAppendAfterCloseRunsCloserInline(t *testing.T) {
+	lifo := NewLIFO()
+	require.NoError(t, lifo.Close())
+
+	late := &testCloser{}
+
+	require.NotPanics(t, func() {
+		lifo.Append(late)
+	})
+
+	assert.Equal(t, 1, late.called, "late closer must be closed inline")
+	assert.Empty(t, lifo.stack, "late closer must not be stored")
 }
